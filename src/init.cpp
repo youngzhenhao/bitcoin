@@ -3,9 +3,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#if defined(HAVE_CONFIG_H)
-#include <config/bitcoin-config.h>
-#endif
+#include <config/bitcoin-config.h> // IWYU pragma: keep
 
 #include <init.h>
 
@@ -34,6 +32,8 @@
 #include <interfaces/chain.h>
 #include <interfaces/init.h>
 #include <interfaces/node.h>
+#include <kernel/context.h>
+#include <key.h>
 #include <logging.h>
 #include <mapport.h>
 #include <net.h>
@@ -71,12 +71,14 @@
 #include <txdb.h>
 #include <txmempool.h>
 #include <util/asmap.h>
+#include <util/batchpriority.h>
 #include <util/chaintype.h>
 #include <util/check.h>
 #include <util/fs.h>
 #include <util/fs_helpers.h>
 #include <util/moneystr.h>
 #include <util/result.h>
+#include <util/signalinterrupt.h>
 #include <util/strencodings.h>
 #include <util/string.h>
 #include <util/syserror.h>
@@ -124,7 +126,6 @@ using node::CalculateCacheSizes;
 using node::DEFAULT_PERSIST_MEMPOOL;
 using node::DEFAULT_PRINTPRIORITY;
 using node::DEFAULT_STOPATHEIGHT;
-using node::fReindex;
 using node::KernelNotifications;
 using node::LoadChainstate;
 using node::MempoolPath;
@@ -373,6 +374,7 @@ void Shutdown(NodeContext& node)
     node.chainman.reset();
     node.validation_signals.reset();
     node.scheduler.reset();
+    node.ecc_context.reset();
     node.kernel.reset();
 
     RemovePidFile(*node.args);
@@ -1093,6 +1095,10 @@ bool AppInitSanityChecks(const kernel::Context& kernel)
         return InitError(strprintf(_("Initialization sanity check failed. %s is shutting down."), PACKAGE_NAME));
     }
 
+    if (!ECC_InitSanityCheck()) {
+        return InitError(strprintf(_("Elliptic curve cryptography sanity check failure. %s is shutting down."), PACKAGE_NAME));
+    }
+
     // Probe the data directory lock to give an early error message, if possible
     // We cannot hold the data directory lock here, as the forking for daemon() hasn't yet happened,
     // and a fork will cause weird behavior to it.
@@ -1485,7 +1491,6 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
 
     node.notifications = std::make_unique<KernelNotifications>(*Assert(node.shutdown), node.exit_status);
     ReadNotificationArgs(args, *node.notifications);
-    fReindex = args.GetBoolArg("-reindex", false);
     bool fReindexChainState = args.GetBoolArg("-reindex-chainstate", false);
     ChainstateManager::Options chainman_opts{
         .chainparams = chainparams,
@@ -1562,7 +1567,7 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
 
         node::ChainstateLoadOptions options;
         options.mempool = Assert(node.mempool.get());
-        options.reindex = node::fReindex;
+        options.reindex = chainman.m_blockman.m_reindexing;
         options.reindex_chainstate = fReindexChainState;
         options.prune = chainman.m_blockman.IsPruneMode();
         options.check_blocks = args.GetIntArg("-checkblocks", DEFAULT_CHECKBLOCKS);
@@ -1610,7 +1615,7 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
                     error.original + ".\nPlease restart with -reindex or -reindex-chainstate to recover.",
                     "", CClientUIInterface::MSG_ERROR | CClientUIInterface::BTN_ABORT);
                 if (fRet) {
-                    fReindex = true;
+                    chainman.m_blockman.m_reindexing = true;
                     if (!Assert(node.shutdown)->reset()) {
                         LogPrintf("Internal error: failed to reset shutdown signal.\n");
                     }
@@ -1643,17 +1648,17 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     // ********************************************************* Step 8: start indexers
 
     if (args.GetBoolArg("-txindex", DEFAULT_TXINDEX)) {
-        g_txindex = std::make_unique<TxIndex>(interfaces::MakeChain(node), cache_sizes.tx_index, false, fReindex);
+        g_txindex = std::make_unique<TxIndex>(interfaces::MakeChain(node), cache_sizes.tx_index, false, chainman.m_blockman.m_reindexing);
         node.indexes.emplace_back(g_txindex.get());
     }
 
     for (const auto& filter_type : g_enabled_filter_types) {
-        InitBlockFilterIndex([&]{ return interfaces::MakeChain(node); }, filter_type, cache_sizes.filter_index, false, fReindex);
+        InitBlockFilterIndex([&]{ return interfaces::MakeChain(node); }, filter_type, cache_sizes.filter_index, false, chainman.m_blockman.m_reindexing);
         node.indexes.emplace_back(GetBlockFilterIndex(filter_type));
     }
 
     if (args.GetBoolArg("-coinstatsindex", DEFAULT_COINSTATSINDEX)) {
-        g_coin_stats_index = std::make_unique<CoinStatsIndex>(interfaces::MakeChain(node), /*cache_size=*/0, false, fReindex);
+        g_coin_stats_index = std::make_unique<CoinStatsIndex>(interfaces::MakeChain(node), /*cache_size=*/0, false, chainman.m_blockman.m_reindexing);
         node.indexes.emplace_back(g_coin_stats_index.get());
     }
 
@@ -1672,7 +1677,7 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     // if pruning, perform the initial blockstore prune
     // after any wallet rescanning has taken place.
     if (chainman.m_blockman.IsPruneMode()) {
-        if (!fReindex) {
+        if (!chainman.m_blockman.m_reindexing) {
             LOCK(cs_main);
             for (Chainstate* chainstate : chainman.GetAll()) {
                 uiInterface.InitMessage(_("Pruning blockstore…").translated);
@@ -1698,7 +1703,7 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     int chain_active_height = WITH_LOCK(cs_main, return chainman.ActiveChain().Height());
 
     // On first startup, warn on low block storage space
-    if (!fReindex && !fReindexChainState && chain_active_height <= 1) {
+    if (!chainman.m_blockman.m_reindexing && !fReindexChainState && chain_active_height <= 1) {
         uint64_t assumed_chain_bytes{chainparams.AssumedBlockchainSize() * 1024 * 1024 * 1024};
         uint64_t additional_bytes_needed{
             chainman.m_blockman.IsPruneMode() ?
@@ -1744,6 +1749,7 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     }
 
     chainman.m_thread_load = std::thread(&util::TraceThread, "initload", [=, &chainman, &args, &node] {
+        ScheduleBatchPriority();
         // Import blocks
         ImportBlocks(chainman, vImportFiles);
         if (args.GetBoolArg("-stopafterblockimport", DEFAULT_STOPAFTERBLOCKIMPORT)) {
